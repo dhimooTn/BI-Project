@@ -10,7 +10,7 @@
             </Attribute>
           </value>
         </entry>
-        <entry key="\etl\hellowork_etl.csv">
+        <entry key="\data\hellowork_etl.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
