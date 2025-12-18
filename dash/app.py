@@ -1,46 +1,55 @@
 import dash
-from dash import dcc, html, ctx, dash_table
+from dash import dcc, html, dash_table
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 import plotly.express as px
-import pandas as pd
 import plotly.graph_objects as go
+import pandas as pd
+
+# ⭐ CRITIQUE: Importer FrequencyEncoder AVANT model_predictor
+from frequency_encoder import FrequencyEncoder
 
 import layouts
 from gestionnaire import db_manager
+from model_predictor import predictor
 
-# --- CONSTANTES ---
+# Constantes
 GEOJSON_URL = "https://france-geojson.wladimir.me/regions.geojson"
 
-# --- CONFIG APP ---
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.ZEPHYR, dbc.icons.FONT_AWESOME],
+# Configuration App
+app = dash.Dash(__name__,
+                external_stylesheets=[dbc.themes.ZEPHYR, dbc.icons.FONT_AWESOME],
                 suppress_callback_exceptions=True)
 server = app.server
 
 
-# --- CHARGEMENT DONNÉES ---
 def load_data_complete():
+    """Charge et prépare les données"""
     df = db_manager.get_all_data()
 
-    if not df.empty and 'departement' in df.columns:
-        # 1. Nettoyage du département : on force le string et le format 2 chiffres (ex: 1 -> "01")
-        # .astype(str) gère les nombres, .split('.')[0] gère les floats (1.0 -> 1), .zfill(2) met le 0 devant
-        df['departement'] = df['departement'].astype(str).apply(lambda x: x.split('.')[0].zfill(2))
+    if not df.empty:
+        if 'departement' in df.columns:
+            df['departement'] = df['departement'].astype(str).apply(
+                lambda x: x.split('.')[0].zfill(2))
 
-        # 2. Mapping région
-        df['region'] = df['departement'].apply(lambda x: layouts.DEPT_TO_REGION.get(x[:2], "Autre"))
+        if 'categorie_salaire' in df.columns:
+            df['categorie_salaire_label'] = df['categorie_salaire'].apply(
+                lambda x: "Haut salaire" if x == 1 else "Bas salaire")
+
+        if 'temps_travail' in df.columns:
+            df['temps_travail_label'] = df['temps_travail'].apply(
+                lambda x: "Temps plein" if x == 1 else "Temps partiel")
 
     return df
 
 
-# Variable globale initiale
 df = load_data_complete()
 
-# --- LAYOUT GLOBAL ---
+# Layout principal
 app.layout = html.Div([
     dcc.Location(id="url", refresh=False),
-    dcc.Store(id='region-store', data=[]),
+    dcc.Store(id='selection-store', data={'cities': [], 'depts': []}),
     layouts.sidebar,
     html.Div(id="page-content", style=layouts.CONTENT_STYLE, children=[
         html.Div(id="view-dashboard", children=layouts.dashboard_layout),
@@ -50,7 +59,7 @@ app.layout = html.Div([
 ])
 
 
-# --- CALLBACK 1 : ROUTAGE ---
+# CALLBACK 1: ROUTAGE
 @app.callback(
     [Output("view-dashboard", "style"),
      Output("view-dataset", "style"),
@@ -60,6 +69,7 @@ app.layout = html.Div([
     [Input("url", "pathname")]
 )
 def render_page(pathname):
+    """Gère la navigation entre les pages"""
     dash_style = {'display': 'block'}
     data_style = {'display': 'none'}
     add_style = {'display': 'none'}
@@ -67,186 +77,241 @@ def render_page(pathname):
     table_data = dash.no_update
 
     if pathname == "/dataset":
-        dash_style, data_style = {'display': 'none'}, {'display': 'block'}
+        dash_style = {'display': 'none'}
+        data_style = {'display': 'block'}
         filter_style = {'display': 'none'}
-        current_df = db_manager.get_all_data()
-        table_data = current_df.to_dict('records')
+        table_data = db_manager.get_all_data().to_dict('records')
 
     elif pathname == "/add":
-        dash_style, add_style = {'display': 'none'}, {'display': 'block'}
+        dash_style = {'display': 'none'}
+        add_style = {'display': 'block'}
         filter_style = {'display': 'none'}
 
     return dash_style, data_style, add_style, filter_style, table_data
 
 
-# --- CALLBACK 2 : AJOUT OFFRE ---
+# CALLBACK 2: AJOUT OFFRE
 @app.callback(
     Output("add-feedback", "children"),
     Input("btn-save-add", "n_clicks"),
     [State("add-title", "value"),
      State("add-company", "value"),
+     State("add-region", "value"),
      State("add-dept", "value"),
+     State("add-city", "value"),
      State("add-salary", "value"),
      State("add-worktime", "value")]
 )
-def save_offer(n_clicks, title, company, dept, salary, worktime):
+def save_offer(n_clicks, title, company, region, dept, city, salary, worktime):
+    """Enregistre une nouvelle offre avec prédiction du cluster"""
     global df
-    if not n_clicks: raise PreventUpdate
+
+    if not n_clicks:
+        raise PreventUpdate
 
     if not all([title, company, dept, salary]):
-        return dbc.Alert("Merci de remplir tous les champs obligatoires.", color="danger")
+        return dbc.Alert("Merci de remplir tous les champs obligatoires.",
+                         color="danger")
 
     try:
         sal_val = float(salary)
-        dept_str = str(dept).zfill(2)
+        dept_val = int(dept)
+        cat = 1 if sal_val > 35000 else 0  # Médiane
+        temps_val = 1 if worktime == "1" else 0
+        location_value = city if city else region
 
-        # Calcul automatique de la région
-        nom_region = layouts.DEPT_TO_REGION.get(dept_str[:2], "Autre")
+        # Prédiction du cluster
+        if predictor and predictor.model:
+            cluster_predit = predictor.predict_cluster(
+                emploi=title, entreprise=company, ville=location_value,
+                departement=dept_val, salaire=sal_val,
+                categorie_salaire=cat, temps_travail=temps_val
+            )
+        else:
+            cluster_predit = 0
+            print("⚠️ Modèle non disponible, cluster par défaut: 0")
 
-        mediane = 35000
-        cat = "Haut" if sal_val > mediane else "Bas"
-        temps_str = "Temps plein" if worktime == "1" else "Temps partiel"
-
-        # Ajout DB avec les bons arguments
-        ok = db_manager.ajouter(title, company, nom_region, dept_str, sal_val, cat, temps_str)
+        # Ajout en base
+        ok = db_manager.ajouter(title, company, location_value, dept_val,
+                                sal_val, cat, temps_val, cluster_predit)
 
         if ok:
             df = load_data_complete()
-            return dbc.Alert("Offre ajoutée avec succès ! Retournez au tableau de bord pour voir les changements.",
-                             color="success")
+            return dbc.Alert([
+                html.H5("✅ Offre ajoutée avec succès!", className="alert-heading"),
+                html.P(f"Classée dans le Cluster {cluster_predit}"),
+                html.Hr(),
+                html.P("Retournez au dashboard pour voir les changements.", className="mb-0")
+            ], color="success")
         else:
-            return dbc.Alert("Erreur lors de l'enregistrement en base de données.", color="danger")
+            return dbc.Alert("Erreur lors de l'enregistrement.", color="danger")
 
     except ValueError:
-        return dbc.Alert("Le salaire doit être un nombre valide.", color="danger")
+        return dbc.Alert("Le salaire et le département doivent être des nombres.",
+                         color="danger")
+    except Exception as e:
+        return dbc.Alert(f"Erreur: {e}", color="danger")
 
 
-# --- CALLBACK 3 : SELECTION CARTE ---
+# CALLBACK 3: RESET FILTRES
 @app.callback(
-    [Output('selected-regions-list', 'children'), Output('region-store', 'data')],
-    [Input('graph-map', 'clickData'), Input('btn-reset-map', 'n_clicks')],
-    [State('region-store', 'data')]
+    [Output('filter-city', 'value'),
+     Output('filter-dept', 'value'),
+     Output('filter-cluster', 'value'),
+     Output('filter-company', 'value')],
+    Input('btn-reset-map', 'n_clicks')
 )
-def update_selection(clickData, n_reset, current):
-    if not current: current = []
-    trigger = ctx.triggered_id
-
-    if trigger == 'btn-reset-map':
-        return [], []
-
-    if trigger == 'graph-map' and clickData:
-        loc = clickData['points'][0]['location']
-        if loc in current:
-            current.remove(loc)
-        else:
-            current.append(loc)
-
-    badges = [dbc.Badge(r, color="info", className="me-1") for r in current]
-    return badges, current
+def reset_filters(n_clicks):
+    """Réinitialise tous les filtres"""
+    if not n_clicks:
+        raise PreventUpdate
+    return None, None, None, None
 
 
-# --- CALLBACK 4 : UPDATE DASHBOARD ---
+def dept_to_region(dept):
+    """Convertit un département en région"""
+    try:
+        dept_num = int(str(dept).split('.')[0])
+    except:
+        return "Autre"
+
+    mapping = {
+        range(75, 96): "Île-de-France",
+        (14, 27, 50, 61, 76): "Normandie",
+        (22, 29, 35, 56): "Bretagne",
+        (44, 49, 53, 72, 85): "Pays de la Loire",
+        (18, 28, 36, 37, 41, 45): "Centre-Val de Loire",
+        (21, 25, 39, 58, 70, 71, 89, 90): "Bourgogne-Franche-Comté",
+        (2, 59, 60, 62, 80): "Hauts-de-France",
+        (8, 10, 51, 52, 54, 55, 57, 67, 68, 88): "Grand Est",
+        (16, 17, 19, 23, 24, 33, 40, 47, 64, 79, 86, 87): "Nouvelle-Aquitaine",
+        (9, 11, 12, 30, 31, 32, 34, 46, 48, 65, 66, 81, 82): "Occitanie",
+        (1, 3, 7, 15, 26, 38, 42, 43, 63, 69, 73, 74): "Auvergne-Rhône-Alpes",
+        (4, 5, 6, 13, 83, 84): "Provence-Alpes-Côte d'Azur",
+        (20, 201, 202): "Corse"
+    }
+
+    for depts, region in mapping.items():
+        if dept_num in depts if isinstance(depts, tuple) else dept_num in depts:
+            return region
+
+    return "Autre"
+
+
+# CALLBACK 4: UPDATE DASHBOARD
 @app.callback(
-    [Output('kpi-count', 'children'), Output('kpi-salary', 'children'), Output('kpi-dept', 'children'),
-     Output('graph-map', 'figure'), Output('graph-time', 'figure'), Output('graph-cat-salary', 'figure'),
-     Output('graph-jobs', 'figure'), Output('graph-box', 'figure'), Output('selection-feedback', 'children')],
-    [Input('region-store', 'data'), Input('filter-cluster', 'value'), Input('filter-company', 'value')]
+    [Output('kpi-count', 'children'),
+     Output('kpi-salary', 'children'),
+     Output('kpi-dept', 'children'),
+     Output('graph-map', 'figure'),
+     Output('graph-time', 'figure'),
+     Output('graph-cat-salary', 'figure'),
+     Output('graph-jobs', 'figure'),
+     Output('graph-box', 'figure'),
+     Output('selection-feedback', 'children')],
+    [Input('filter-city', 'value'),
+     Input('filter-dept', 'value'),
+     Input('filter-cluster', 'value'),
+     Input('filter-company', 'value')]
 )
-def update_dashboard(regions, clusters, companies):
+def update_dashboard(cities, depts, clusters, companies):
+    """Met à jour tous les graphiques selon les filtres"""
     dff = df.copy()
 
-    # Filtres
-    if regions: dff = dff[dff['region'].isin(regions)]
-    if clusters: dff = dff[dff['cluster'].isin(clusters)]
-    if companies: dff = dff[dff['entreprise'].isin(companies)]
+    # Application des filtres
+    if cities:
+        dff = dff[dff['region'].isin(cities)]
+    if depts:
+        depts_str = [str(d).zfill(2) for d in depts]
+        dff = dff[dff['departement'].isin(depts_str)]
+    if clusters:
+        dff = dff[dff['cluster'].isin(clusters)]
+    if companies:
+        dff = dff[dff['entreprise'].isin(companies)]
 
     # KPIs
     count = len(dff)
-    avg = f"{dff['salaire_annuel'].mean():,.0f} €" if count > 0 and pd.notnull(dff['salaire_annuel'].mean()) else "-"
+    avg = f"{dff['salaire_annuel'].mean():,.0f} €" if count > 0 else "-"
+    nb_dept = dff['departement'].nunique() if count > 0 else 0
 
-    # Correction nom colonne KPI
-    nb_dept = dff['departement'].nunique() if 'departement' in dff.columns else 0
-
-    # Graph vide par défaut
+    # Figure vide par défaut
     empty = go.Figure().update_layout(
         xaxis={'visible': False}, yaxis={'visible': False},
-        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)'
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        annotations=[dict(text="Pas de données", xref="paper", yref="paper",
+                          showarrow=False, font=dict(size=20))]
     )
-    empty.add_annotation(text="Pas de données", xref="paper", yref="paper", showarrow=False, font=dict(size=20))
 
     if count == 0:
-        return 0, "-", 0, empty, empty, empty, empty, empty, "Aucune donnée trouvée"
+        return 0, "-", 0, empty, empty, empty, empty, empty, "Aucune donnée"
 
-    # --- 1. CARTE (Mapbox) ---
-    # Groupement par région
-    if 'region' in dff.columns:
-        df_map = dff.groupby('region').size().reset_index(name='c')
-    else:
-        df_map = pd.DataFrame(columns=['region', 'c'])
+    # 1. CARTE
+    dff['region_mapped'] = dff['departement'].apply(dept_to_region)
+    df_region = dff.groupby('region_mapped').size().reset_index(name='count')
+    df_region = df_region[df_region['region_mapped'] != 'Autre']
 
-    fig_map = px.choropleth_mapbox(
-        df_map,
-        geojson=GEOJSON_URL,
-        locations='region',
-        featureidkey="properties.nom",
-        color='c',
-        color_continuous_scale="Teal",
-        mapbox_style="carto-positron",
-        zoom=4.8,
-        center={"lat": 46.5, "lon": 2.2},
-        opacity=0.7,
-        labels={'c': 'Offres'}
+    all_regions = ['Auvergne-Rhône-Alpes', 'Bourgogne-Franche-Comté', 'Bretagne',
+                   'Centre-Val de Loire', 'Corse', 'Grand Est', 'Hauts-de-France',
+                   'Île-de-France', 'Normandie', 'Nouvelle-Aquitaine', 'Occitanie',
+                   'Pays de la Loire', "Provence-Alpes-Côte d'Azur"]
+
+    df_all = pd.DataFrame({'region_mapped': all_regions})
+    df_map = df_all.merge(df_region, on='region_mapped', how='left').fillna(0)
+
+    fig_map = px.choropleth_map(
+        df_map, geojson=GEOJSON_URL, locations='region_mapped',
+        featureidkey="properties.nom", color='count',
+        color_continuous_scale=[[0, '#f0f0f0'], [0.00001, '#FF6B35'],
+                                [0.5, '#E63946'], [1, '#8B0000']],
+        map_style="carto-positron", zoom=4.8, center={"lat": 46.5, "lon": 2.2},
+        labels={'count': "Offres", 'region_mapped': 'Région'}
     )
-    fig_map.update_layout(
-        margin={"r": 0, "t": 0, "l": 0, "b": 0},
-        clickmode='event+select'
-    )
+    fig_map.update_traces(marker_line_width=1.5, marker_line_color='white')
+    fig_map.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0})
 
-    # --- 2. CAMEMBERT TEMPS ---
-    fig_time = px.pie(dff, names='temps_travail', hole=0.6, color_discrete_sequence=px.colors.qualitative.Prism)
+    # 2. CAMEMBERT TEMPS
+    fig_time = px.pie(dff, names='temps_travail_label', hole=0.6,
+                      color_discrete_sequence=px.colors.qualitative.Prism)
     fig_time.update_layout(
-        margin={"r": 10, "t": 10, "l": 10, "b": 10},
-        showlegend=False,
+        margin={"r": 10, "t": 10, "l": 10, "b": 10}, showlegend=False,
         annotations=[dict(text=f"{count}", x=0.5, y=0.5, font_size=20, showarrow=False)]
     )
 
-    # --- 3. BARRES SALAIRES ---
-    cat_counts = dff['categorie_salaire'].value_counts().reset_index()
-    cat_counts.columns = ['categorie_salaire', 'count']
+    # 3. BARRES SALAIRES
+    cat_counts = dff['categorie_salaire_label'].value_counts().reset_index()
+    cat_counts.columns = ['categorie', 'count']
+    fig_cat = px.bar(cat_counts, x='count', y='categorie', orientation='h',
+                     text='count', color='categorie',
+                     color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig_cat.update_layout(margin={"r": 10, "t": 0, "l": 0, "b": 0},
+                          xaxis={'visible': False}, yaxis={'title': ''},
+                          showlegend=False, plot_bgcolor='rgba(0,0,0,0)')
 
-    fig_cat = px.bar(cat_counts, x='count', y='categorie_salaire', orientation='h',
-                     text='count', color='categorie_salaire', color_discrete_sequence=px.colors.qualitative.Pastel)
-    fig_cat.update_layout(
-        margin={"r": 10, "t": 0, "l": 0, "b": 0},
-        xaxis={'visible': False},
-        yaxis={'title': ''},
-        showlegend=False,
-        plot_bgcolor='rgba(0,0,0,0)'
-    )
-
-    # --- 4. TOP JOBS ---
+    # 4. TOP JOBS
     top_jobs = dff['emploi'].value_counts().head(10).reset_index()
     top_jobs.columns = ['emploi', 'count']
-
     fig_jobs = px.bar(top_jobs, x='count', y='emploi', orientation='h', text='count')
-    fig_jobs.update_layout(
-        margin={"r": 10, "t": 0, "l": 0, "b": 0},
-        yaxis={'autorange': "reversed", 'title': ''},
-        xaxis={'title': 'Nombre d\'offres'},
-        plot_bgcolor='rgba(0,0,0,0)'
-    )
+    fig_jobs.update_layout(margin={"r": 10, "t": 0, "l": 0, "b": 0},
+                           yaxis={'autorange': "reversed", 'title': ''},
+                           xaxis={'title': "Nombre d'offres"},
+                           plot_bgcolor='rgba(0,0,0,0)')
 
-    # --- 5. BOX PLOT CLUSTERS ---
+    # 5. BOX PLOT
     fig_box = px.box(dff, x='cluster', y='salaire_annuel', color='cluster', points=False)
-    fig_box.update_layout(
-        margin={"r": 0, "t": 0, "l": 0, "b": 30},
-        showlegend=False,
-        xaxis={'title': 'Cluster'},
-        yaxis={'title': 'Salaire Annuel'},
-        plot_bgcolor='white'
-    )
+    fig_box.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 30},
+                          showlegend=False, xaxis={'title': 'Cluster'},
+                          yaxis={'title': 'Salaire'}, plot_bgcolor='white')
 
-    return count, avg, nb_dept, fig_map, fig_time, fig_cat, fig_jobs, fig_box, f"{count} offres filtrées"
+    # Feedback
+    filters = []
+    if cities: filters.append(f"{len(cities)} ville(s)")
+    if depts: filters.append(f"{len(depts)} dép.")
+    if clusters: filters.append(f"{len(clusters)} cluster(s)")
+    if companies: filters.append(f"{len(companies)} entreprise(s)")
+
+    feedback = f"{count} offres" + (f" filtrées par: {', '.join(filters)}" if filters else "")
+
+    return count, avg, nb_dept, fig_map, fig_time, fig_cat, fig_jobs, fig_box, feedback
 
 
 if __name__ == '__main__':

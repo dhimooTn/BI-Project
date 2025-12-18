@@ -3,8 +3,8 @@ import sqlite3
 import os
 
 # Nom des fichiers
-csv_file = "C:/Users/Manai/PycharmProjects/BI-Project/data/hellowork_clustered.csv"
-db_file = "C:/Users/Manai/PycharmProjects/BI-Project/dash/hellowork.db"
+csv_file = "C:/Projects/Project Bi/data/hellowork_clustered.csv"
+db_file = "hellowork.db"
 
 # 1. Vérifier si le CSV existe
 if not os.path.exists(csv_file):

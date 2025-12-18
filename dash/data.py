@@ -1,62 +1,79 @@
 import pandas as pd
-import sqlite3
 import os
-from gestionnaire import db_manager  # On utilise le chemin du gestionnaire
+from gestionnaire import db_manager
 
-# --- CONFIGURATION ---
-# Mettez ici le chemin vers votre CSV
-csv_file = "C:/Users/Manai/PycharmProjects/BI-Project/data/hellowork_clustered.csv"
+# Configuration
+CSV_FILE = r"C:\Projects\Project Bi\data\hellowork_clustered.csv"
 
-# Vérification présence CSV
-if not os.path.exists(csv_file):
-    print(f"❌ ERREUR : Fichier introuvable : {csv_file}")
-    exit()
 
-print("✅ CSV trouvé. Traitement en cours...")
+def import_csv_to_db(csv_path):
+    """Importe un CSV dans la base de données"""
 
-try:
-    # 1. Lecture
-    df = pd.read_csv(csv_file)
-    print(f"📊 Lignes lues : {len(df)}")
-    print(f"   Colonnes initiales : {df.columns.tolist()}")
+    # Vérification
+    if not os.path.exists(csv_path):
+        print(f"❌ Fichier introuvable: {csv_path}")
+        return False
 
-    # 2. RENOMMAGE DES COLONNES (Mapping)
-    # À GAUCHE : Les noms dans VOTRE CSV / À DROITE : Les noms pour l'APP
-    # Adaptez la partie gauche si votre CSV est différent (ex: 'Job Title' au lieu de 'intitule')
-    mapping = {
-        'intitule': 'emploi',
-        'company': 'entreprise',
-        'city': 'region',
-        'dept': 'departement',
-        'salary': 'salaire_annuel',
-        'contract': 'temps_travail',
-        'cluster': 'cluster'
-    }
+    print(f"✅ CSV trouvé: {csv_path}")
 
-    # On renomme uniquement ce qui existe
-    df.rename(columns=mapping, inplace=True)
+    try:
+        # Lecture
+        df = pd.read_csv(csv_path)
+        print(f"📊 {len(df)} lignes lues")
+        print(f"   Colonnes: {df.columns.tolist()}")
 
-    # 3. Nettoyage rapide avant insertion
-    # Forcer le code département en string (ex: "01" et pas 1)
-    if 'departement' in df.columns:
-        df['departement'] = df['departement'].apply(lambda x: str(x).zfill(2) if pd.notnull(x) else "00")
+        # Mapping des colonnes (adaptez selon votre CSV)
+        column_mapping = {
+            'intitule': 'emploi',
+            'company': 'entreprise',
+            'city': 'region',
+            'dept': 'departement',
+            'salary': 'salaire_annuel',
+            'contract': 'temps_travail',
+            'cluster': 'cluster'
+        }
 
-    # S'assurer que les colonnes manquantes existent pour éviter le crash SQL
-    required_cols = ['emploi', 'entreprise', 'region', 'departement',
-                     'salaire_annuel', 'categorie_salaire', 'temps_travail', 'cluster']
+        df.rename(columns=column_mapping, inplace=True)
 
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = None  # On remplit avec vide si manquant
+        # Nettoyage
+        if 'departement' in df.columns:
+            df['departement'] = df['departement'].apply(
+                lambda x: str(x).zfill(2) if pd.notnull(x) else "00")
 
-    # 4. Insertion via SQLite direct (sur le même chemin que le gestionnaire)
-    conn = db_manager.get_connection()
+        # Colonnes requises
+        required = ['emploi', 'entreprise', 'region', 'departement',
+                    'salaire_annuel', 'categorie_salaire', 'temps_travail', 'cluster']
 
-    # On vide et on remplace
-    df.to_sql("offres", conn, if_exists="replace", index=False)
+        for col in required:
+            if col not in df.columns:
+                df[col] = None
 
-    print(f"🎉 SUCCÈS : Données importées dans {db_manager.db_path}")
-    conn.close()
+        # Insertion
+        conn = db_manager.get_connection()
+        df.to_sql("offres", conn, if_exists="replace", index=False)
+        conn.close()
 
-except Exception as e:
-    print(f"❌ CRASH : {e}")
+        print(f"🎉 Import réussi: {len(df)} offres")
+        print(f"   Base: {db_manager.db_path}")
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Erreur: {e}")
+        return False
+
+
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("📥 IMPORT CSV → BASE DE DONNÉES")
+    print("=" * 60 + "\n")
+
+    success = import_csv_to_db(CSV_FILE)
+
+    if success:
+        stats = db_manager.get_stats()
+        print("\n📊 Statistiques:")
+        for key, value in stats.items():
+            print(f"   {key}: {value}")
+
+    print("\n" + "=" * 60)
