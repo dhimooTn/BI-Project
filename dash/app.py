@@ -14,9 +14,6 @@ import layouts
 from gestionnaire import db_manager
 from model_predictor import predictor
 
-# Constantes
-GEOJSON_URL = "https://france-geojson.wladimir.me/regions.geojson"
-
 # Configuration App
 app = dash.Dash(__name__,
                 external_stylesheets=[dbc.themes.ZEPHYR, dbc.icons.FONT_AWESOME],
@@ -88,6 +85,54 @@ def render_page(pathname):
         filter_style = {'display': 'none'}
 
     return dash_style, data_style, add_style, filter_style, table_data
+
+
+# CALLBACK 1.5: FILTRE BIDIRECTIONNEL VILLE ↔ DÉPARTEMENT
+@app.callback(
+    [Output('filter-dept', 'options'),
+     Output('filter-city', 'options')],
+    [Input('filter-city', 'value'),
+     Input('filter-dept', 'value')]
+)
+def update_filters_bidirectional(selected_cities, selected_depts):
+    """Met à jour les options de département et ville de manière bidirectionnelle"""
+    # Options par défaut (toutes les données)
+    all_unique_depts = sorted([int(d) for d in df['departement'].dropna().unique()
+                               if str(d).replace('.', '').isdigit() or isinstance(d, (int, float))])
+    all_dept_options = [{'label': f"Département {d:02d}", 'value': d} for d in all_unique_depts]
+
+    all_unique_cities = sorted(df['region'].dropna().unique().tolist()[:100]) if 'region' in df.columns else []
+    all_city_options = [{'label': city, 'value': city} for city in all_unique_cities]
+
+    # Si rien n'est sélectionné, retourner toutes les options
+    if (not selected_cities or len(selected_cities) == 0) and (not selected_depts or len(selected_depts) == 0):
+        return all_dept_options, all_city_options
+
+    # Cas 1: Villes sélectionnées → filtrer départements
+    if selected_cities and len(selected_cities) > 0:
+        dff_city = df[df['region'].isin(selected_cities)]
+        if not dff_city.empty:
+            filtered_depts = sorted([int(d) for d in dff_city['departement'].dropna().unique()
+                                     if str(d).replace('.', '').isdigit() or isinstance(d, (int, float))])
+            dept_options = [{'label': f"Département {d:02d}", 'value': d} for d in filtered_depts]
+        else:
+            dept_options = []
+    else:
+        dept_options = all_dept_options
+
+    # Cas 2: Départements sélectionnés → filtrer villes
+    if selected_depts and len(selected_depts) > 0:
+        depts_str = [str(d).zfill(2) for d in selected_depts]
+        dff_dept = df[df['departement'].isin(depts_str)]
+        if not dff_dept.empty:
+            filtered_cities = sorted(dff_dept['region'].dropna().unique().tolist())
+            city_options = [{'label': city, 'value': city} for city in filtered_cities]
+        else:
+            city_options = []
+    else:
+        city_options = all_city_options
+
+    return dept_options, city_options
 
 
 # CALLBACK 2: AJOUT OFFRE
@@ -168,6 +213,30 @@ def reset_filters(n_clicks):
     return None, None, None, None
 
 
+# CALLBACK 3.5: SÉLECTION RÉGION DEPUIS TREEMAP
+@app.callback(
+    Output('filter-city', 'value', allow_duplicate=True),
+    Input('graph-map', 'clickData'),
+    prevent_initial_call=True
+)
+def update_from_treemap(click_data):
+    """Met à jour le filtre ville selon la région cliquée dans le treemap"""
+    if not click_data:
+        raise PreventUpdate
+
+    try:
+        # Extraire la région cliquée
+        region_clicked = click_data['points'][0]['label']
+
+        # Trouver toutes les villes de cette région
+        dff = df[df['departement'].apply(dept_to_region) == region_clicked]
+        cities_in_region = dff['region'].dropna().unique().tolist()
+
+        return cities_in_region
+    except:
+        raise PreventUpdate
+
+
 def dept_to_region(dept):
     """Convertit un département en région"""
     try:
@@ -245,29 +314,37 @@ def update_dashboard(cities, depts, clusters, companies):
     if count == 0:
         return 0, "-", 0, empty, empty, empty, empty, empty, "Aucune donnée"
 
-    # 1. CARTE
+    # 1. TREEMAP (remplace la carte)
     dff['region_mapped'] = dff['departement'].apply(dept_to_region)
-    df_region = dff.groupby('region_mapped').size().reset_index(name='count')
-    df_region = df_region[df_region['region_mapped'] != 'Autre']
 
-    all_regions = ['Auvergne-Rhône-Alpes', 'Bourgogne-Franche-Comté', 'Bretagne',
-                   'Centre-Val de Loire', 'Corse', 'Grand Est', 'Hauts-de-France',
-                   'Île-de-France', 'Normandie', 'Nouvelle-Aquitaine', 'Occitanie',
-                   'Pays de la Loire', "Provence-Alpes-Côte d'Azur"]
+    # Grouper par région et calculer les statistiques
+    df_region = dff.groupby('region_mapped').agg({
+        'salaire_annuel': ['count', 'mean']
+    }).reset_index()
+    df_region.columns = ['region', 'count', 'avg_salary']
+    df_region = df_region[df_region['region'] != 'Autre']
 
-    df_all = pd.DataFrame({'region_mapped': all_regions})
-    df_map = df_all.merge(df_region, on='region_mapped', how='left').fillna(0)
-
-    fig_map = px.choropleth_map(
-        df_map, geojson=GEOJSON_URL, locations='region_mapped',
-        featureidkey="properties.nom", color='count',
-        color_continuous_scale=[[0, '#f0f0f0'], [0.00001, '#FF6B35'],
-                                [0.5, '#E63946'], [1, '#8B0000']],
-        map_style="carto-positron", zoom=4.8, center={"lat": 46.5, "lon": 2.2},
-        labels={'count': "Offres", 'region_mapped': 'Région'}
+    # Créer le treemap
+    fig_map = px.treemap(
+        df_region,
+        path=['region'],
+        values='count',
+        color='avg_salary',
+        color_continuous_scale='RdYlGn',
+        labels={'count': 'Nombre d\'offres', 'avg_salary': 'Salaire moyen', 'region': 'Région'},
+        title='Distribution des offres par région'
     )
-    fig_map.update_traces(marker_line_width=1.5, marker_line_color='white')
-    fig_map.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0})
+
+    fig_map.update_traces(
+        textinfo='label+value',
+        textfont_size=12,
+        marker=dict(line=dict(width=2, color='white'))
+    )
+
+    fig_map.update_layout(
+        margin=dict(t=40, l=0, r=0, b=0),
+        font=dict(size=11)
+    )
 
     # 2. CAMEMBERT TEMPS
     fig_time = px.pie(dff, names='temps_travail_label', hole=0.6,
